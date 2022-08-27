@@ -1,133 +1,189 @@
-/* File:     mpi_trap1.c
- * Purpose:  Use MPI to implement a parallel version of the trapezoidal 
- *           rule.  In this version the endpoints of the interval and
- *           the number of trapezoids are hardwired.
- *
- * Input:    None.
- * Output:   Estimate of the integral from a to b of f(x)
- *           using the trapezoidal rule and n trapezoids.
- *
- * Compile:  mpicc -g -Wall -o mpi_trap1 mpi_trap1.c
- * Run:      mpiexec -n <number of processes> ./mpi_trap1
- *
- * Algorithm:
- *    1.  Each process calculates "its" interval of
- *        integration.
- *    2.  Each process estimates the integral of f(x)
- *        over its interval using the trapezoidal rule.
- *    3a. Each process != 0 sends its integral to 0.
- *    3b. Process 0 sums the calculations received from
- *        the individual processes and prints the result.
- *
- * Note:  f(x), a, b, and n are all hardwired.
- *
- * IPP:   Section 3.2.2 (pp. 96 and ff.)
- * 
- * Plotar função online: https://www.desmos.com/calculator?lang=pt-BR
- *     f(x)=x^2-4x +8
- *     a = 0
- *     b = 3
- *     0 <= y <= f(x){(a-x)(b-x)<0}
- */
+#include <stdlib.h>
 #include <stdio.h>
+#include <pthread.h>
+#include <semaphore.h>
 
-/* We'll be using MPI routines, definitions, etc. */
-#include <mpi.h>
+const long thread_count = 8;
+double GLOBAL_MUTEX_SUM = 0;
+double GLOBAL_SEM_SUM = 0;
+double GLOBAL_BUSY_SUM = 0;
 
-/* Calculate local integral  */
-double Trap(double left_endpt, double right_endpt, int trap_count, 
-   double base_len);    
+pthread_mutex_t mutex;
+sem_t semaphore;
 
-/* Function we're integrating */
-double f(double x); 
+int wait_flag = 0;
 
-int main(void) {
-   int my_rank, comm_sz, n = 10000000, local_n;   
-   double a = 1.0, b = 5.0, h, local_a, local_b;
-   double local_int, total_int;
-   int source; 
+double a = 1.0, b = 5.0, h;      
+int n = 10000000;      
 
-   /* Let the system do what it needs to start up MPI */
-   MPI_Init(NULL, NULL);
-
-   /* Get my process rank */
-   MPI_Comm_rank(MPI_COMM_WORLD, &my_rank);
-
-   /* Find out how many processes are being used */
-   MPI_Comm_size(MPI_COMM_WORLD, &comm_sz);
-
-   h = (b-a)/n;          /* h is the same for all processes */
-   local_n = n/comm_sz;  /* So is the number of trapezoids  */
-
-   /* Length of each process' interval of
-    * integration = local_n*h.  So my interval
-    * starts at: */
-   local_a = a + my_rank*local_n*h;
-   local_b = local_a + local_n*h;
-   local_int = Trap(local_a, local_b, local_n, h);
-
-   /* Add up the integrals calculated by each process */
-   if (my_rank != 0) { 
-      MPI_Send(&local_int, 1, MPI_DOUBLE, 0, 0, MPI_COMM_WORLD); 
-   } else {
-      total_int = local_int;
-      for (source = 1; source < comm_sz; source++) {
-         MPI_Recv(&local_int, 1, MPI_DOUBLE, source, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-         total_int += local_int;
-      }
-   } 
-
-   /* Print the result */
-   if (my_rank == 0) {
-      printf("With n = %d trapezoids, our estimate\n", n);
-      printf("of the integral from %f to %f = %.15e\n",
-          a, b, total_int);
-   }
-
-   /* Shut down MPI */
-   MPI_Finalize();
-
-   return 0;
-} /*  main  */
+double f(double x);
+double serial_trapezoid();
+void* mutex_trapezoid(void* rank);
+void* sem_trapezoid(void* rank);
+void mutex_main();
+void sem_main();
 
 
-/*------------------------------------------------------------------
- * Function:     Trap
- * Purpose:      Serial function for estimating a definite integral 
- *               using the trapezoidal rule
- * Input args:   left_endpt
- *               right_endpt
- *               trap_count 
- *               base_len
- * Return val:   Trapezoidal rule estimate of integral from
- *               left_endpt to right_endpt using trap_count
- *               trapezoids
- */
-double Trap(
-      double left_endpt  /* in */, 
-      double right_endpt /* in */, 
-      int    trap_count  /* in */, 
-      double base_len    /* in */) {
-   
-   double estimate, x; 
-   int i;
-
-   for (i = 0; i <= trap_count-1; i++) {
-      x = left_endpt + i*base_len;
-      estimate += (f(x) + f(x+base_len));
-   }
-   estimate = estimate*base_len*0.5;
-
-   return estimate;
-} /*  Trap  */
+// MACROS provided by Dr. Karlsson for distributing work to threads
+#define BLOCK_LOW(id,p,n) ((id)*(n)/(p))
+#define BLOCK_HIGH(id,p,n)  (BLOCK_LOW((id)+1,p,n)-1)
 
 
-/*------------------------------------------------------------------
- * Function:    f
- * Purpose:     Compute value of function to be integrated
- * Input args:  x
- */
-double f(double x) {
-   return x*x - 4*x + 8;
-   //return x*x;
-} /* f */
+
+int main( int argc, char **argv )
+
+{
+  double integral;  
+
+  h = (b-a)/n;
+  integral = serial_trapezoid();
+
+  printf("With n = %d trapezoids, our estimate\n", n);
+  printf("of the integral from %f to %f = %.15e\n\n",
+    a, b, integral);
+
+  mutex_main();
+  sem_main();
+
+  return 0;
+}
+
+double serial_trapezoid()
+{
+  double integral;
+  int i;
+
+  integral = (f(a)+f(b))/2.0;
+
+  for( i=1; i <= n-1; i++)
+  {
+    integral += f(a+(i*h));
+  }
+  integral = integral*h;
+
+  return integral;
+}
+
+
+void* mutex_trapezoid(void* rank)
+{ 
+  long thread_rank = (long)rank;
+  double local_sum = 0.0;
+  long long i;
+  int special_case = (int)thread_rank;
+
+
+  long long my_first_i = BLOCK_LOW(thread_rank, thread_count, n); //AAAAAA
+  long long my_last_i = BLOCK_HIGH(thread_rank, thread_count, n);
+
+  if( special_case == 1)
+  {
+    local_sum += (f(a)+f(b))/2.0;
+  }
+
+  for( i= my_first_i; i <= my_last_i; i++)
+  {
+    local_sum += f(a+(i*h));
+  }
+  local_sum = local_sum * h;
+
+  pthread_mutex_lock(&mutex);
+  GLOBAL_MUTEX_SUM += local_sum;
+  pthread_mutex_unlock(&mutex);
+
+  return NULL;
+ 
+}
+
+
+void* sem_trapezoid(void *rank)
+{
+  long thread_rank = (long)rank;
+  double local_sum = 0.0;
+  long long i;
+  int special_case = (int)thread_rank;
+
+  // allocate a chunk of work to the thread
+  long long my_first_i = BLOCK_LOW(thread_rank, thread_count, n);
+  long long my_last_i = BLOCK_HIGH(thread_rank, thread_count, n);
+
+  if( special_case == 1)
+  {
+    local_sum += (f(a)+f(b))/2.0;
+  }
+
+  // Karlsson's trapezoid code
+  for( i= my_first_i; i <= my_last_i; i++)
+  {
+    local_sum += f(a+(i*h));
+  }
+  local_sum = local_sum * h;
+
+  // update the global sum
+  sem_wait(&semaphore);
+  GLOBAL_SEM_SUM += local_sum;
+  sem_post(&semaphore);
+
+  return NULL;
+}
+
+
+void mutex_main()
+{
+  pthread_t* thread_handles;
+
+
+  pthread_mutex_init(&mutex, NULL);
+  thread_handles = malloc( thread_count * sizeof(pthread_t));
+
+  long thread;
+  for( thread=0; thread < thread_count; thread++)
+    pthread_create( &thread_handles[thread], NULL, mutex_trapezoid, 
+      (void*) thread );
+
+  for( thread=0; thread < thread_count; thread++)
+    pthread_join( thread_handles[thread], NULL);
+
+  free(thread_handles);
+  pthread_mutex_destroy(&mutex);
+
+  printf("MUTEX\n");
+  printf("With n = %d trapezoids, our estimate\n", n);
+  printf("of the integral from %f to %f = %.15e\n\n",
+    a, b, GLOBAL_MUTEX_SUM);  
+}
+
+
+void sem_main()
+{
+    pthread_t* thread_handles;
+
+  sem_init(&semaphore, 0, 1);
+  thread_handles = malloc( thread_count * sizeof(pthread_t));
+
+
+  long thread;
+  for( thread=0; thread < thread_count; thread++)
+    pthread_create( &thread_handles[thread], NULL, sem_trapezoid, 
+      (void*) thread);
+
+
+  for( thread=0; thread < thread_count; thread++)
+    pthread_join( thread_handles[thread], NULL);
+
+  free(thread_handles);
+  sem_destroy(&semaphore);
+
+  printf("SEMAPHORE\n");
+  printf("With n = %d trapezoids, our estimate\n", n);
+  printf("of the integral from %f to %f = %.15e\n\n",
+    a, b, GLOBAL_SEM_SUM);  
+}
+
+
+
+
+double f(double x)
+{
+  return x*x;
+}
